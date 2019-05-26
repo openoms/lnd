@@ -3024,7 +3024,9 @@ func (c *ChannelGraph) ChannelView() ([]EdgePoint, error) {
 				edgeIndex, chanID,
 			)
 			if err != nil {
-				return err
+				log.Errorf("Unable to fetch edge info for "+
++				  "channel %v: %v", chanPoint, err)
++				return nil
 			}
 
 			pkScript, err := genMultiSigP2WSH(
