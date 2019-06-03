@@ -2,7 +2,6 @@ package lnd
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -70,10 +69,10 @@ const (
 var (
 	zeroHash [32]byte
 
-	// maxPaymentMSat is the maximum allowed payment currently permitted as
+	// MaxPaymentMSat is the maximum allowed payment currently permitted as
 	// defined in BOLT-002. This value depends on which chain is active.
 	// It is set to the value under the Bitcoin chain as default.
-	maxPaymentMSat = maxBtcPaymentMSat
+	MaxPaymentMSat = maxBtcPaymentMSat
 
 	defaultAccount uint32 = waddrmgr.DefaultAccountNum
 
@@ -451,7 +450,7 @@ func newRPCServer(s *server, macService *macaroons.Service,
 	}
 	graph := s.chanDB.ChannelGraph()
 	routerBackend := &routerrpc.RouterBackend{
-		MaxPaymentMSat: maxPaymentMSat,
+		MaxPaymentMSat: MaxPaymentMSat,
 		SelfNode:       selfNode.PubKeyBytes,
 		FetchChannelCapacity: func(chanID uint64) (btcutil.Amount,
 			error) {
@@ -1357,9 +1356,9 @@ func (r *rpcServer) OpenChannel(in *lnrpc.OpenChannelRequest,
 	// Ensure that the user doesn't exceed the current soft-limit for
 	// channel size. If the funding amount is above the soft-limit, then
 	// we'll reject the request.
-	if localFundingAmt > maxFundingAmount {
+	if localFundingAmt > MaxFundingAmount {
 		return fmt.Errorf("funding amount is too large, the max "+
-			"channel size is: %v", maxFundingAmount)
+			"channel size is: %v", MaxFundingAmount)
 	}
 
 	// Restrict the size of the channel we'll actually open. At a later
@@ -1459,7 +1458,7 @@ out:
 			switch update := fundingUpdate.Update.(type) {
 			case *lnrpc.OpenStatusUpdate_ChanOpen:
 				chanPoint := update.ChanOpen.ChannelPoint
-				txid, err := getChanPointFundingTxid(chanPoint)
+				txid, err := GetChanPointFundingTxid(chanPoint)
 				if err != nil {
 					return err
 				}
@@ -1610,9 +1609,9 @@ func (r *rpcServer) OpenChannelSync(ctx context.Context,
 	}
 }
 
-// getChanPointFundingTxid returns the given channel point's funding txid in
+// GetChanPointFundingTxid returns the given channel point's funding txid in
 // raw bytes.
-func getChanPointFundingTxid(chanPoint *lnrpc.ChannelPoint) (*chainhash.Hash, error) {
+func GetChanPointFundingTxid(chanPoint *lnrpc.ChannelPoint) (*chainhash.Hash, error) {
 	var txid []byte
 
 	// A channel point's funding txid can be get/set as a byte slice or a
@@ -1647,7 +1646,7 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 
 	force := in.Force
 	index := in.ChannelPoint.OutputIndex
-	txid, err := getChanPointFundingTxid(in.GetChannelPoint())
+	txid, err := GetChanPointFundingTxid(in.GetChannelPoint())
 	if err != nil {
 		rpcsLog.Errorf("[closechannel] unable to get funding txid: %v", err)
 		return err
@@ -1855,7 +1854,7 @@ func (r *rpcServer) AbandonChannel(ctx context.Context,
 
 	// We'll parse out the arguments to we can obtain the chanPoint of the
 	// target channel.
-	txid, err := getChanPointFundingTxid(in.GetChannelPoint())
+	txid, err := GetChanPointFundingTxid(in.GetChannelPoint())
 	if err != nil {
 		return nil, err
 	}
@@ -2099,6 +2098,8 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 	}
 
 	// Get confirmed balance, from txs that have >= 1 confirmations.
+	// TODO(halseth): get both unconfirmed and confirmed balance in one
+	// call, as this is racy.
 	confirmedBal, err := r.server.cc.wallet.ConfirmedBalance(1)
 	if err != nil {
 		return nil, err
@@ -2107,7 +2108,8 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 	// Get unconfirmed balance, from txs with 0 confirmations.
 	unconfirmedBal := totalBal - confirmedBal
 
-	rpcsLog.Debugf("[walletbalance] Total balance=%v", totalBal)
+	rpcsLog.Debugf("[walletbalance] Total balance=%v (confirmed=%v, "+
+		"unconfirmed=%v)", totalBal, confirmedBal, unconfirmedBal)
 
 	return &lnrpc.WalletBalanceResponse{
 		TotalBalance:       int64(totalBal),
@@ -2735,33 +2737,6 @@ func (r *rpcServer) SubscribeChannelEvents(req *lnrpc.ChannelEventSubscription,
 	}
 }
 
-// savePayment saves a successfully completed payment to the database for
-// historical record keeping.
-func (r *rpcServer) savePayment(route *route.Route,
-	amount lnwire.MilliSatoshi, preImage []byte) error {
-
-	paymentPath := make([][33]byte, len(route.Hops))
-	for i, hop := range route.Hops {
-		hopPub := hop.PubKeyBytes
-		copy(paymentPath[i][:], hopPub[:])
-	}
-
-	payment := &channeldb.OutgoingPayment{
-		Invoice: channeldb.Invoice{
-			Terms: channeldb.ContractTerm{
-				Value: amount,
-			},
-			CreationDate: time.Now(),
-		},
-		Path:           paymentPath,
-		Fee:            route.TotalFees(),
-		TimeLockLength: route.TotalTimeLock,
-	}
-	copy(payment.PaymentPreimage[:], preImage)
-
-	return r.server.chanDB.AddPayment(payment)
-}
-
 // validatePayReqExpiry checks if the passed payment request has expired. In
 // the case it has expired, an error will be returned.
 func validatePayReqExpiry(payReq *zpay32.Invoice) error {
@@ -2900,6 +2875,7 @@ type rpcPaymentIntent struct {
 	cltvDelta         uint16
 	routeHints        [][]zpay32.HopHint
 	outgoingChannelID *uint64
+	payReq            []byte
 
 	route *route.Route
 }
@@ -2988,6 +2964,7 @@ func extractPaymentIntent(rpcPayReq *rpcPaymentRequest) (rpcPaymentIntent, error
 		copy(payIntent.dest[:], destKey)
 		payIntent.cltvDelta = uint16(payReq.MinFinalCLTVExpiry())
 		payIntent.routeHints = payReq.RouteHints
+		payIntent.payReq = []byte(rpcPayReq.PaymentRequest)
 
 		return payIntent, nil
 	}
@@ -3050,12 +3027,12 @@ func extractPaymentIntent(rpcPayReq *rpcPaymentRequest) (rpcPaymentIntent, error
 	// Currently, within the bootstrap phase of the network, we limit the
 	// largest payment size allotted to (2^32) - 1 mSAT or 4.29 million
 	// satoshis.
-	if payIntent.msat > maxPaymentMSat {
+	if payIntent.msat > MaxPaymentMSat {
 		// In this case, we'll send an error to the caller, but
 		// continue our loop for the next payment.
 		return payIntent, fmt.Errorf("payment of %v is too large, "+
 			"max payment allowed is %v", payIntent.msat,
-			maxPaymentMSat)
+			MaxPaymentMSat)
 
 	}
 
@@ -3096,6 +3073,7 @@ func (r *rpcServer) dispatchPaymentIntent(
 			PaymentHash:       payIntent.rHash,
 			RouteHints:        payIntent.routeHints,
 			OutgoingChannelID: payIntent.outgoingChannelID,
+			PaymentRequest:    payIntent.payReq,
 		}
 
 		// If the final CLTV value was specified, then we'll use that
@@ -3121,18 +3099,6 @@ func (r *rpcServer) dispatchPaymentIntent(
 		return &paymentIntentResponse{
 			Err: routerErr,
 		}, nil
-	}
-
-	// Calculate amount paid to receiver.
-	amt := route.TotalAmount - route.TotalFees()
-
-	// Save the completed payment to the database for record keeping
-	// purposes.
-	err := r.savePayment(route, amt, preImage[:])
-	if err != nil {
-		// We weren't able to save the payment, so we return the save
-		// err, but a nil routing err.
-		return nil, err
 	}
 
 	return &paymentIntentResponse{
@@ -3387,7 +3353,7 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 		IsChannelActive:   r.server.htlcSwitch.HasActiveLink,
 		ChainParams:       activeNetParams.Params,
 		NodeSigner:        r.server.nodeSigner,
-		MaxPaymentMSat:    maxPaymentMSat,
+		MaxPaymentMSat:    MaxPaymentMSat,
 		DefaultCLTVExpiry: defaultDelta,
 		ChanDB:            r.server.chanDB,
 	}
@@ -4146,8 +4112,8 @@ func (r *rpcServer) ListPayments(ctx context.Context,
 
 	rpcsLog.Debugf("[ListPayments]")
 
-	payments, err := r.server.chanDB.FetchAllPayments()
-	if err != nil && err != channeldb.ErrNoPaymentsCreated {
+	payments, err := r.server.chanDB.FetchPayments()
+	if err != nil {
 		return nil, err
 	}
 
@@ -4155,24 +4121,38 @@ func (r *rpcServer) ListPayments(ctx context.Context,
 		Payments: make([]*lnrpc.Payment, len(payments)),
 	}
 	for i, payment := range payments {
-		path := make([]string, len(payment.Path))
-		for i, hop := range payment.Path {
-			path[i] = hex.EncodeToString(hop[:])
+		// If a payment attempt has been made we can fetch the route.
+		// Otherwise we'll just populate the RPC response with an empty
+		// one.
+		var route route.Route
+		if payment.Attempt != nil {
+			route = payment.Attempt.Route
+		}
+		path := make([]string, len(route.Hops))
+		for i, hop := range route.Hops {
+			path[i] = hex.EncodeToString(hop.PubKeyBytes[:])
 		}
 
-		msatValue := int64(payment.Terms.Value)
-		satValue := int64(payment.Terms.Value.ToSatoshis())
+		// If this payment is settled, the preimage will be available.
+		var preimage lntypes.Preimage
+		if payment.PaymentPreimage != nil {
+			preimage = *payment.PaymentPreimage
+		}
 
-		paymentHash := sha256.Sum256(payment.PaymentPreimage[:])
+		msatValue := int64(payment.Info.Value)
+		satValue := int64(payment.Info.Value.ToSatoshis())
+
+		paymentHash := payment.Info.PaymentHash
 		paymentsResp.Payments[i] = &lnrpc.Payment{
 			PaymentHash:     hex.EncodeToString(paymentHash[:]),
 			Value:           satValue,
 			ValueMsat:       msatValue,
 			ValueSat:        satValue,
-			CreationDate:    payment.CreationDate.Unix(),
+			CreationDate:    payment.Info.CreationDate.Unix(),
 			Path:            path,
-			Fee:             int64(payment.Fee.ToSatoshis()),
-			PaymentPreimage: hex.EncodeToString(payment.PaymentPreimage[:]),
+			Fee:             int64(route.TotalFees().ToSatoshis()),
+			PaymentPreimage: hex.EncodeToString(preimage[:]),
+			PaymentRequest:  string(payment.Info.PaymentRequest),
 		}
 	}
 
@@ -4185,7 +4165,7 @@ func (r *rpcServer) DeleteAllPayments(ctx context.Context,
 
 	rpcsLog.Debugf("[DeleteAllPayments]")
 
-	if err := r.server.chanDB.DeleteAllPayments(); err != nil {
+	if err := r.server.chanDB.DeletePayments(); err != nil {
 		return nil, err
 	}
 
@@ -4441,7 +4421,7 @@ func (r *rpcServer) UpdateChannelPolicy(ctx context.Context,
 	// Otherwise, we're targeting an individual channel by its channel
 	// point.
 	case *lnrpc.PolicyUpdateRequest_ChanPoint:
-		txid, err := getChanPointFundingTxid(scope.ChanPoint)
+		txid, err := GetChanPointFundingTxid(scope.ChanPoint)
 		if err != nil {
 			return nil, err
 		}
@@ -4622,7 +4602,7 @@ func (r *rpcServer) ExportChannelBackup(ctx context.Context,
 
 	// First, we'll convert the lnrpc channel point into a wire.OutPoint
 	// that we can manipulate.
-	txid, err := getChanPointFundingTxid(in.ChanPoint)
+	txid, err := GetChanPointFundingTxid(in.ChanPoint)
 	if err != nil {
 		return nil, err
 	}

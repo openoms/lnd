@@ -616,42 +616,50 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		return nil, err
 	}
 
+	queryBandwidth := func(edge *channeldb.ChannelEdgeInfo) lnwire.MilliSatoshi {
+		// If we aren't on either side of this edge, then we'll
+		// just thread through the capacity of the edge as we
+		// know it.
+		if !bytes.Equal(edge.NodeKey1Bytes[:], selfNode.PubKeyBytes[:]) &&
+			!bytes.Equal(edge.NodeKey2Bytes[:], selfNode.PubKeyBytes[:]) {
+
+			return lnwire.NewMSatFromSatoshis(edge.Capacity)
+		}
+
+		cid := lnwire.NewChanIDFromOutPoint(&edge.ChannelPoint)
+		link, err := s.htlcSwitch.GetLink(cid)
+		if err != nil {
+			// If the link isn't online, then we'll report
+			// that it has zero bandwidth to the router.
+			return 0
+		}
+
+		// If the link is found within the switch, but it isn't
+		// yet eligible to forward any HTLCs, then we'll treat
+		// it as if it isn't online in the first place.
+		if !link.EligibleToForward() {
+			return 0
+		}
+
+		// Otherwise, we'll return the current best estimate
+		// for the available bandwidth for the link.
+		return link.Bandwidth()
+	}
+
+	missionControl := routing.NewMissionControl(
+		chanGraph, selfNode, queryBandwidth,
+	)
+
 	s.chanRouter, err = routing.New(routing.Config{
 		Graph:              chanGraph,
 		Chain:              cc.chainIO,
 		ChainView:          cc.chainView,
 		Payer:              s.htlcSwitch,
+		Control:            channeldb.NewPaymentControl(chanDB),
+		MissionControl:     missionControl,
 		ChannelPruneExpiry: routing.DefaultChannelPruneExpiry,
 		GraphPruneInterval: time.Duration(time.Hour),
-		QueryBandwidth: func(edge *channeldb.ChannelEdgeInfo) lnwire.MilliSatoshi {
-			// If we aren't on either side of this edge, then we'll
-			// just thread through the capacity of the edge as we
-			// know it.
-			if !bytes.Equal(edge.NodeKey1Bytes[:], selfNode.PubKeyBytes[:]) &&
-				!bytes.Equal(edge.NodeKey2Bytes[:], selfNode.PubKeyBytes[:]) {
-
-				return lnwire.NewMSatFromSatoshis(edge.Capacity)
-			}
-
-			cid := lnwire.NewChanIDFromOutPoint(&edge.ChannelPoint)
-			link, err := s.htlcSwitch.GetLink(cid)
-			if err != nil {
-				// If the link isn't online, then we'll report
-				// that it has zero bandwidth to the router.
-				return 0
-			}
-
-			// If the link is found within the switch, but it isn't
-			// yet eligible to forward any HTLCs, then we'll treat
-			// it as if it isn't online in the first place.
-			if !link.EligibleToForward() {
-				return 0
-			}
-
-			// Otherwise, we'll return the current best estimate
-			// for the available bandwidth for the link.
-			return link.Bandwidth()
-		},
+		QueryBandwidth:     queryBandwidth,
 		AssumeChannelValid: cfg.Routing.UseAssumeChannelValid(),
 		NextPaymentID:      sequencer.NextID,
 	})
@@ -686,6 +694,8 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		RotateTicker:         ticker.New(discovery.DefaultSyncerRotationInterval),
 		HistoricalSyncTicker: ticker.New(cfg.HistoricalSyncInterval),
 		NumActiveSyncers:     cfg.NumGraphSyncPeers,
+		MinimumBatchSize:     10,
+		SubBatchDelay:        time.Second * 5,
 	},
 		s.identityPriv.PubKey(),
 	)
@@ -717,13 +727,14 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		NewBatchTimer: func() <-chan time.Time {
 			return time.NewTimer(sweep.DefaultBatchWindowDuration).C
 		},
-		SweepTxConfTarget:    6,
 		Notifier:             cc.chainNotifier,
 		ChainIO:              cc.chainIO,
 		Store:                sweeperStore,
 		MaxInputsPerTx:       sweep.DefaultMaxInputsPerTx,
 		MaxSweepAttempts:     sweep.DefaultMaxSweepAttempts,
 		NextAttemptDeltaFunc: sweep.DefaultNextAttemptDeltaFunc,
+		MaxFeeRate:           sweep.DefaultMaxFeeRate,
+		FeeRateBucketSize:    sweep.DefaultFeeRateBucketSize,
 	})
 
 	s.utxoNursery = newUtxoNursery(&NurseryConfig{
@@ -751,8 +762,8 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 
 	s.chainArb = contractcourt.NewChainArbitrator(contractcourt.ChainArbitratorConfig{
 		ChainHash:              *activeNetParams.GenesisHash,
-		IncomingBroadcastDelta: defaultIncomingBroadcastDelta,
-		OutgoingBroadcastDelta: defaultOutgoingBroadcastDelta,
+		IncomingBroadcastDelta: DefaultIncomingBroadcastDelta,
+		OutgoingBroadcastDelta: DefaultOutgoingBroadcastDelta,
 		NewSweepAddr: func() ([]byte, error) {
 			return newSweepPkScript(cc.wallet)
 		},
@@ -930,7 +941,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 			minConf := uint64(3)
 			maxConf := uint64(6)
 			maxChannelSize := uint64(
-				lnwire.NewMSatFromSatoshis(maxFundingAmount))
+				lnwire.NewMSatFromSatoshis(MaxFundingAmount))
 			stake := lnwire.NewMSatFromSatoshis(chanAmt) + pushAmt
 			conf := maxConf * uint64(stake) / maxChannelSize
 			if conf < minConf {
@@ -946,7 +957,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 			// remote have to claim funds in case of a unilateral
 			// close) linearly from minRemoteDelay blocks
 			// for small channels, to maxRemoteDelay blocks
-			// for channels of size maxFundingAmount.
+			// for channels of size MaxFundingAmount.
 			// TODO(halseth): Litecoin parameter for LTC.
 
 			// In case the user has explicitly specified
@@ -959,7 +970,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 
 			// If not we scale according to channel size.
 			delay := uint16(btcutil.Amount(maxRemoteDelay) *
-				chanAmt / maxFundingAmount)
+				chanAmt / MaxFundingAmount)
 			if delay < minRemoteDelay {
 				delay = minRemoteDelay
 			}
